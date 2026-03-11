@@ -38,10 +38,6 @@ class MainActivity : FlutterActivity() {
     @Volatile private var decoding = false
     @Volatile private var decodeStartedAtMs: Long = 0L
 
-    private val tickMs: Long = 200
-    private val decodeSeconds: Float = 1.0f
-    private val minDecodeSamples: Long = 16000L
-
     @Volatile private var samplesPushed: Long = 0
     @Volatile private var samplesLastDecoded: Long = 0
 
@@ -85,74 +81,23 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun scheduleDecode(reason: String) {
-        logD("scheduleDecode(reason=$reason) thread=${Thread.currentThread().name} ${gateState()}")
-        worker.removeCallbacks(decodeRunnable)
-        worker.post(decodeRunnable)
-    }
+    private fun emitPartialIfChanged(raw: String): String {
+        val text = cleanText(raw)
+        logD("decoded clean len=${text.length}")
 
-    private val decodeRunnable = object : Runnable {
-        override fun run() {
-            logD("decodeRunnable ENTER thread=${Thread.currentThread().name} ${gateState()}")
-
-            if (!running) {
-                logD("decodeRunnable EXIT because running=false")
-                return
-            }
-
-            val newSamples = samplesPushed - samplesLastDecoded
-            if (newSamples < minDecodeSamples) {
-                logD("decodeRunnable SKIP not enough new audio: $newSamples / $minDecodeSamples")
-                worker.postDelayed(this, tickMs)
-                return
-            }
-
-            if (decoding) {
-                logD("decodeRunnable SKIP because decoding=true")
-                worker.postDelayed(this, tickMs)
-                return
-            }
-
-            decoding = true
-            decodeStartedAtMs = SystemClock.elapsedRealtime()
-            samplesLastDecoded = samplesPushed
-            mainHandler.removeCallbacks(decodeWatchdog)
-            mainHandler.postDelayed(decodeWatchdog, 1000)
-
-            try {
-                val timer = PerfTimer(PERF, "kotlin.decodePartial_total")
-                logD("Calling WhisperNative.decodePartial(seconds=$decodeSeconds)")
-                val raw = WhisperNative.decodePartial(decodeSeconds)
-                timer.done("rawLen=${raw.length}")
-                logD("decodePartial raw head='${raw.take(80)}'")
-
-                val text = cleanText(raw)
-                logD("decoded clean len=${text.length}")
-
-                if (text.isNotEmpty() && text != lastSentText) {
-                    lastSentText = text
-                    logI("Sending partial to Flutter len=${text.length}")
-                    mainHandler.post {
-                        eventSink?.success(
-                            mapOf(
-                                "type" to "partial",
-                                "text" to text
-                            )
-                        )
-                    }
-                }
-            } catch (e: Exception) {
-                logE("decodePartial error", e)
-            } finally {
-                decoding = false
-                decodeStartedAtMs = 0L
-                mainHandler.removeCallbacks(decodeWatchdog)
-
-                if (running) {
-                    worker.postDelayed(this, tickMs)
-                }
+        if (text.isNotEmpty() && text != lastSentText) {
+            lastSentText = text
+            logI("Sending partial to Flutter len=${text.length}")
+            mainHandler.post {
+                eventSink?.success(
+                    mapOf(
+                        "type" to "partial",
+                        "text" to text
+                    )
+                )
             }
         }
+        return text
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -226,8 +171,59 @@ class MainActivity : FlutterActivity() {
                         }
 
                         logI("After start state: ${gateState()}")
-                        scheduleDecode("start")
                         result.success(true)
+                    }
+
+                    "flushDecode" -> {
+                        worker.post {
+                            try {
+                                logI("flushDecode requested ${gateState()}")
+
+                                if (!running) {
+                                    mainHandler.post { result.success(lastSentText) }
+                                    return@post
+                                }
+
+                                if (decoding) {
+                                    logW("flushDecode skipped because decoding=true")
+                                    mainHandler.post { result.success(lastSentText) }
+                                    return@post
+                                }
+
+                                val totalSamples = samplesPushed
+                                if (totalSamples <= 0) {
+                                    logI("flushDecode no audio")
+                                    mainHandler.post { result.success(lastSentText) }
+                                    return@post
+                                }
+
+                                decoding = true
+                                decodeStartedAtMs = SystemClock.elapsedRealtime()
+                                mainHandler.removeCallbacks(decodeWatchdog)
+                                mainHandler.postDelayed(decodeWatchdog, 1000)
+
+                                // Decode the whole utterance.
+                                val utteranceSeconds = totalSamples / 16000.0f
+                                val forceSeconds = minOf(utteranceSeconds, 6.0f)
+
+                                val timer = PerfTimer(PERF, "kotlin.flushDecode_total")
+                                logI("Calling forced WhisperNative.decodePartial(seconds=$forceSeconds)")
+                                val raw = WhisperNative.decodePartial(forceSeconds)
+                                timer.done("rawLen=${raw.length}")
+
+                                samplesLastDecoded = samplesPushed
+                                val text = emitPartialIfChanged(raw)
+
+                                mainHandler.post { result.success(text) }
+                            } catch (e: Exception) {
+                                logE("flushDecode error", e)
+                                mainHandler.post { result.error("ERR", e.message, e.toString()) }
+                            } finally {
+                                decoding = false
+                                decodeStartedAtMs = 0L
+                                mainHandler.removeCallbacks(decodeWatchdog)
+                            }
+                        }
                     }
 
                     "stop" -> {
@@ -238,7 +234,6 @@ class MainActivity : FlutterActivity() {
                         decoding = false
                         decodeStartedAtMs = 0L
                         samplesLastDecoded = samplesPushed
-                        worker.removeCallbacks(decodeRunnable)
                         mainHandler.removeCallbacks(decodeWatchdog)
 
                         val finalOut = lastSentText.trim()
@@ -307,12 +302,7 @@ class MainActivity : FlutterActivity() {
                             logE("WhisperNative.pushPcm16 failed", e)
                         }
 
-                        val newSamples = samplesPushed - samplesLastDecoded
                         logD("Gate after push: ${gateState()}")
-
-                        if (running && !decoding && newSamples >= minDecodeSamples) {
-                            scheduleDecode("pushPcmBytes")
-                        }
 
                         totalTimer.done()
                         result.success(true)
@@ -330,7 +320,6 @@ class MainActivity : FlutterActivity() {
         logI("onDestroy() called")
         running = false
         decoding = false
-        worker.removeCallbacks(decodeRunnable)
         mainHandler.removeCallbacks(decodeWatchdog)
         workerThread.quitSafely()
         super.onDestroy()

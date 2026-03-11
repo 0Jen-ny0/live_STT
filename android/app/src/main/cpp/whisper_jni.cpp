@@ -26,9 +26,7 @@ static const int kSampleRate = 16000;
 static const int kKeepSeconds = 20;
 static const int kKeepSamples = kKeepSeconds * kSampleRate;
 
-// Debug switches
-static const bool kUseZeroAudioTest = false;          // true = benchmark on 1 second of silence
-static const bool kReturnDebugStatusWhenEmpty = true; // true = show timing status on screen when no text
+static const bool kReturnDebugStatusWhenEmpty = true;
 
 static std::vector<float> g_audio;
 static size_t g_start = 0;
@@ -211,8 +209,13 @@ static std::string decode_chunk_with_whisper(const std::vector<float> &chunk, lo
     p.print_timestamps = false;
     p.translate = false;
     p.language = "en";
-    p.n_threads = 4;
+    p.n_threads = 2;
     p.no_context = true;
+
+    // Let Whisper produce normal output for the whole utterance.
+    // Do not artificially cap it to the first short fragment.
+    p.single_segment = false;
+    p.max_tokens = 0;
 
     LOGI("Calling whisper_full on chunkSamples=%d chunkSeconds=%.2f",
          (int) chunk.size(),
@@ -246,11 +249,10 @@ static std::string decode_chunk_with_whisper(const std::vector<float> &chunk, lo
 
             if (!joined.empty()) joined.push_back(' ');
             joined += text;
-
-            LOGD("segment %d: '%s'", i, text.c_str());
         }
 
         trim(joined);
+        LOGI("decode_chunk_with_whisper returning len=%zu text='%s'", joined.size(), joined.c_str());
         return joined;
     }
 }
@@ -258,19 +260,13 @@ static std::string decode_chunk_with_whisper(const std::vector<float> &chunk, lo
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_offline_1stt_1demo_WhisperNative_decodePartial(JNIEnv *env, jclass, jfloat seconds) {
     ScopeTimer total("native.decodePartial_total");
-    LOGI("decodePartial called, seconds=%.2f zeroTest=%d", seconds, kUseZeroAudioTest ? 1 : 0);
+    LOGI("decodePartial called, seconds=%.2f", seconds);
 
     std::vector<float> chunk;
     size_t live = 0;
 
-    if (kUseZeroAudioTest) {
-        chunk.assign(kSampleRate, 0.0f);
-        live = chunk.size();
-        LOGI("ZERO-AUDIO test chunk size=%zu", chunk.size());
-    } else {
-        if (!build_chunk_from_live_audio(seconds, chunk, live)) {
-            return env->NewStringUTF("");
-        }
+    if (!build_chunk_from_live_audio(seconds, chunk, live)) {
+        return env->NewStringUTF("");
     }
 
     long long decodeMs = -1;
@@ -287,8 +283,7 @@ Java_com_example_offline_1stt_1demo_WhisperNative_decodePartial(JNIEnv *env, jcl
         std::snprintf(
             msg,
             sizeof(msg),
-            "%s live=%zu chunk=%zu nseg=%d decodeMs=%lld",
-            kUseZeroAudioTest ? "zero-audio" : "decode-empty",
+            "decode-empty live=%zu chunk=%zu nseg=%d decodeMs=%lld",
             live,
             chunk.size(),
             nseg,
