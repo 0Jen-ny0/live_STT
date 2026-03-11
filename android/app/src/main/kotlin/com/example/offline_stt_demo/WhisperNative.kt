@@ -1,10 +1,20 @@
 package com.example.offline_stt_demo
 
 object WhisperNative {
-    init { System.loadLibrary("whisper_jni") }
+    init {
+        System.loadLibrary("whisper_jni")
+    }
 
-    external fun init(modelPath: String): Boolean
-    external fun reset()
-    external fun pushPcm16(pcm: ShortArray)
-    external fun decodePartial(seconds: Float): String
+    @JvmStatic
+    external fun initContext(modelPath: String, threads: Int): Boolean
+
+    @JvmStatic
+    external fun freeContext()
+
+    @JvmStatic
+    external fun transcribeWindow(
+        audio: FloatArray,
+        language: String,
+        audioCtx: Int,
+    ): String
 }
