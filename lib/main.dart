@@ -1,3 +1,4 @@
+// lib/main.dart
 import 'dart:async';
 import 'dart:collection';
 import 'dart:math';
@@ -49,52 +50,59 @@ class _SttHomePageState extends State<SttHomePage> {
   double rms = 0.0;
   double _rmsSmooth = 0.0;
 
-  // ==============================
-  // Speech / utterance state
-  // ==============================
-  bool _utteranceOpen = false;
-  bool _sttSessionActive = false;
-  bool _sessionStarting = false;
-  bool _sessionStopping = false;
-  int _lastAboveThresholdMs = 0;
-
-  // ==============================
-  // Native send buffers
-  // ==============================
-  final BytesBuilder _pcmBuf = BytesBuilder(copy: false);
-  final BytesBuilder _pendingStartBuf = BytesBuilder(copy: false);
-  bool _draining = false;
-
-  // ==============================
-  // Pre-roll buffer
-  // ==============================
-  final ListQueue<Uint8List> _preRollFrames = ListQueue<Uint8List>();
-  int _preRollBytes = 0;
-
   bool _sttReady = false;
   bool _initInProgress = false;
+
+  // ==============================
+  // Speech detection / utterance capture
+  // ==============================
+  bool _utteranceOpen = false;
+  int _lastAboveThresholdMs = 0;
+  int _utteranceStartMs = 0;
+  final BytesBuilder _currentUtterance = BytesBuilder(copy: false);
+
+  // ==============================
+  // Pre-roll buffer so speech start is not clipped
+  // ==============================
+  final ListQueue<Uint8List> _preRollFrames = ListQueue<Uint8List>();
 
   // 20 ms @ 16 kHz mono PCM16 = 640 bytes
   static const int _frameBytes = 640;
 
-  // Send 200 ms chunks to native
+  // 10 x 20 ms = 200 ms chunks sent to native
   static const int _sendChunkBytes = 6400;
 
   // Keep ~300 ms of pre-roll = 15 x 20 ms frames
   static const int _maxPreRollFrames = 15;
 
+  // Drop extremely tiny utterances
+  static const int _minUtteranceBytes = 3200; // 100 ms
+
+  static const int _queuedSendChunkBytes = 64000; // ~1 second at 16 kHz mono PCM16
+
   // RMS thresholds
   static const double _speechStartRms = 0.012;
   static const double _speechKeepRms = 0.008;
 
-  // Close utterance after this much silence
-  static const int _silenceMsToEnd = 500;
+  // End utterance sooner after silence
+  static const int _silenceMsToEnd = 350;
+
+  // Force-split long utterances to reduce "finishing utterance" delay
+  static const int _maxUtteranceMs = 2000;
+
+  // ==============================
+  // Decode queue
+  // ==============================
+  final Queue<Uint8List> _utteranceQueue = Queue<Uint8List>();
+  bool _processingQueue = false;
+  int _utteranceCounter = 0;
+  int _processedUtterances = 0;
 
   int _micChunkCount = 0;
-  int _chunksSent = 0;
-  int _bytesSent = 0;
   int _partialCount = 0;
   int _finalCount = 0;
+  int _chunksSent = 0;
+  int _bytesSent = 0;
 
   void _log(String msg) {
     debugPrint('[MainSTT] $msg');
@@ -177,11 +185,9 @@ class _SttHomePageState extends State<SttHomePage> {
   void _pushPreRoll(Uint8List chunk) {
     final copy = Uint8List.fromList(chunk);
     _preRollFrames.addLast(copy);
-    _preRollBytes += copy.length;
 
     while (_preRollFrames.length > _maxPreRollFrames) {
-      final removed = _preRollFrames.removeFirst();
-      _preRollBytes -= removed.length;
+      _preRollFrames.removeFirst();
     }
   }
 
@@ -189,152 +195,122 @@ class _SttHomePageState extends State<SttHomePage> {
     return _preRollFrames.map((e) => Uint8List.fromList(e)).toList();
   }
 
-  Future<void> _beginSttSession(List<Uint8List> seedFrames) async {
-    if (_sttSessionActive || _sessionStarting) return;
-    if (_sessionStopping) {
-      _log('Skip begin session because stop is in progress');
+  void _startUtterance() {
+    _utteranceOpen = true;
+    _utteranceStartMs = DateTime.now().millisecondsSinceEpoch;
+    _currentUtterance.clear();
+
+    final seedFrames = _snapshotPreRollFrames();
+    for (final frame in seedFrames) {
+      _currentUtterance.add(frame);
+    }
+
+    _utteranceCounter++;
+    _log('Speech start utterance=$_utteranceCounter seedFrames=${seedFrames.length}');
+
+    if (mounted) {
+      setState(() {
+        partial = '(capturing utterance $_utteranceCounter...)';
+      });
+    }
+  }
+
+  void _enqueueCurrentUtterance() {
+    final bytes = _currentUtterance.takeBytes();
+
+    if (bytes.length < _minUtteranceBytes) {
+      _log('Drop short utterance bytes=${bytes.length}');
       return;
     }
 
-    _sessionStarting = true;
-    final t = PerfTimer('main.beginUtterance');
+    _utteranceQueue.add(Uint8List.fromList(bytes));
+    _log(
+      'Queued utterance #${_utteranceQueue.length + _processedUtterances} '
+      'bytes=${bytes.length} queueSize=${_utteranceQueue.length}',
+    );
 
-    try {
-      await _ensureSttInit();
-
-      if (!running) return;
-
-      await stt.start();
-      _sttSessionActive = true;
-
-      _pcmBuf.clear();
-
-      int seedBytes = 0;
-      for (final frame in seedFrames) {
-        _pcmBuf.add(frame);
-        seedBytes += frame.length;
-      }
-
-      if (_pendingStartBuf.length > 0) {
-        _pcmBuf.add(_pendingStartBuf.takeBytes());
-      }
-
-      _log('STT session started seedBytes=$seedBytes totalBuffered=${_pcmBuf.length}');
-      unawaited(_drainPcm());
-      t.done('buffered=${_pcmBuf.length}');
-    } catch (e) {
-      _log('Failed to begin STT session: $e');
-    } finally {
-      _sessionStarting = false;
-    }
+    unawaited(_processUtteranceQueue());
   }
 
-  Future<void> _drainPcm() async {
-    if (_draining) return;
-    if (!_sttSessionActive) return;
-
-    _draining = true;
-    final t = PerfTimer('main.drainPcm');
+  Future<void> _processUtteranceQueue() async {
+    if (_processingQueue) return;
+    _processingQueue = true;
 
     try {
-      while (_sttSessionActive && _pcmBuf.length >= _sendChunkBytes) {
-        final bytes = _pcmBuf.takeBytes();
+      while (_utteranceQueue.isNotEmpty) {
+        final utterance = _utteranceQueue.removeFirst();
+        _processedUtterances++;
+
+        final utteranceId = _processedUtterances;
+        final utteranceSeconds = utterance.length / (2 * 16000);
+        _log(
+          'Processing utterance #$utteranceId '
+          'bytes=${utterance.length} seconds=${utteranceSeconds.toStringAsFixed(2)}',
+        );
+
+        if (mounted) {
+          setState(() {
+            partial = '(processing utterance #$utteranceId...)';
+          });
+        }
+
+        final startT = PerfTimer('main.decodeUtterance.start');
+        await stt.start();
+        startT.done('utterance=$utteranceId');
 
         int off = 0;
-        while (_sttSessionActive && off + _sendChunkBytes <= bytes.length) {
-          final chunk = bytes.sublist(off, off + _sendChunkBytes);
+        while (off < utterance.length) {
+          final end = min(off + _queuedSendChunkBytes, utterance.length);
+          final chunk = utterance.sublist(off, end);
 
-          final pushTimer = PerfTimer('main.pushChunk');
+          final pushT = PerfTimer('main.pushQueuedUtteranceChunk');
           final ok = await stt.pushPcmBytes(chunk);
-          pushTimer.done('ok=$ok bytes=${chunk.length}');
+          pushT.done('ok=$ok bytes=${chunk.length}');
 
           if (!ok) {
-            _log('Native rejected PCM push; stopping drain');
+            _log('Native rejected queued utterance chunk');
             break;
           }
 
-          off += _sendChunkBytes;
+          off = end;
           _chunksSent++;
           _bytesSent += chunk.length;
-
-          if (_chunksSent % 10 == 1) {
-            _log('Sent PCM chunk #$_chunksSent bytes=${chunk.length}');
-          }
         }
 
-        if (off < bytes.length) {
-          _pcmBuf.add(bytes.sublist(off));
-        }
-      }
-    } finally {
-      _draining = false;
-      t.done('bufferNow=${_pcmBuf.length}');
+        final flushT = PerfTimer('main.flushQueuedUtterance');
+        final flushText = await stt.flushDecode();
+        flushT.done('len=${flushText.length}');
 
-      if (_sttSessionActive && _pcmBuf.length >= _sendChunkBytes) {
-        unawaited(_drainPcm());
-      }
-    }
-  }
-
-  Future<void> _flushRemainingPcm() async {
-    while (_draining) {
-      await Future.delayed(const Duration(milliseconds: 10));
-    }
-
-    while (_sttSessionActive && _pcmBuf.length > 0) {
-      final bytes = _pcmBuf.takeBytes();
-
-      int off = 0;
-      while (_sttSessionActive && off < bytes.length) {
-        final end = min(off + _sendChunkBytes, bytes.length);
-        final chunk = bytes.sublist(off, end);
-
-        final pushTimer = PerfTimer('main.flushChunk');
-        final ok = await stt.pushPcmBytes(chunk);
-        pushTimer.done('ok=$ok bytes=${chunk.length}');
-
-        if (!ok) {
-          _log('Native rejected flush chunk');
-          return;
+        if (flushText.trim().isNotEmpty && mounted) {
+          setState(() {
+            partial = flushText.trim();
+          });
         }
 
-        off = end;
+        await Future.delayed(const Duration(milliseconds: 150));
+
+        final stopT = PerfTimer('main.decodeUtterance.stop');
+        await stt.stop();
+        stopT.done('utterance=$utteranceId');
       }
-    }
-  }
-
-  Future<void> _endSttSession() async {
-    if (_sessionStopping) return;
-
-    _sessionStopping = true;
-    final t = PerfTimer('main.endUtterance');
-
-    try {
-      while (_sessionStarting) {
-        await Future.delayed(const Duration(milliseconds: 10));
-      }
-
-      if (!_sttSessionActive) return;
-
-      _sttSessionActive = false;
-
-      await _flushRemainingPcm();
-
-      final flushText = await stt.flushDecode();
-      _log('flushDecode returned len=${flushText.length} text="$flushText"');
-
-      await Future.delayed(const Duration(milliseconds: 150));
-
-      await stt.stop();
-
-      _pcmBuf.clear();
-      _pendingStartBuf.clear();
-
-      t.done();
     } catch (e) {
-      _log('Failed to end STT session: $e');
+      _log('Queue processing error: $e');
     } finally {
-      _sessionStopping = false;
+      _processingQueue = false;
+
+      if (mounted && running && !_utteranceOpen) {
+        setState(() {
+          if (_utteranceQueue.isEmpty) {
+            partial = '';
+          }
+        });
+      }
+    }
+  }
+
+  Future<void> _waitForQueueToFinish() async {
+    while (_processingQueue || _utteranceQueue.isNotEmpty) {
+      await Future.delayed(const Duration(milliseconds: 50));
     }
   }
 
@@ -357,40 +333,30 @@ class _SttHomePageState extends State<SttHomePage> {
     }
 
     if (!_utteranceOpen && isVoice) {
-      _utteranceOpen = true;
-      _pendingStartBuf.clear();
-
-      if (mounted) {
-        setState(() => partial = '');
-      }
-
-      final seedFrames = _snapshotPreRollFrames();
-      _log(
-        'Speech start rms=${r.toStringAsFixed(4)} '
-        'seedFrames=${seedFrames.length}',
-      );
-      unawaited(_beginSttSession(seedFrames));
-      return;
+      _startUtterance();
     }
 
     if (_utteranceOpen) {
-      if (_sttSessionActive) {
-        _pcmBuf.add(chunk);
-        unawaited(_drainPcm());
-      } else if (_sessionStarting) {
-        _pendingStartBuf.add(chunk);
-      } else if (!_sessionStopping) {
-        _pendingStartBuf.add(chunk);
-        final seedFrames = _snapshotPreRollFrames();
-        _log('Recovering missing STT session during open utterance');
-        unawaited(_beginSttSession(seedFrames));
+      _currentUtterance.add(Uint8List.fromList(chunk));
+
+      // Force split long utterances so final decode has less work.
+      final utteranceMs = nowMs - _utteranceStartMs;
+      if (utteranceMs >= _maxUtteranceMs) {
+        _utteranceOpen = false;
+        _log('Force split utterance at $utteranceMs ms');
+        _enqueueCurrentUtterance();
+
+        if (isVoice) {
+          _startUtterance();
+        }
+        return;
       }
 
       final silenceMs = nowMs - _lastAboveThresholdMs;
       if (silenceMs >= _silenceMsToEnd) {
         _utteranceOpen = false;
         _log('Speech end after $silenceMs ms silence');
-        unawaited(_endSttSession());
+        _enqueueCurrentUtterance();
       }
     }
 
@@ -398,8 +364,8 @@ class _SttHomePageState extends State<SttHomePage> {
       _log(
         'Mic chunk #$_micChunkCount bytes=${chunk.length} '
         'rms=${r.toStringAsFixed(4)} smooth=${_rmsSmooth.toStringAsFixed(4)} '
-        'utteranceOpen=$_utteranceOpen sttActive=$_sttSessionActive '
-        'pcmBuf=${_pcmBuf.length}',
+        'utteranceOpen=$_utteranceOpen queue=${_utteranceQueue.length} '
+        'processing=$_processingQueue currentBytes=${_currentUtterance.length}',
       );
     }
   }
@@ -417,20 +383,20 @@ class _SttHomePageState extends State<SttHomePage> {
     if (!mounted) return;
 
     _utteranceOpen = false;
-    _sttSessionActive = false;
-    _sessionStarting = false;
-    _sessionStopping = false;
     _lastAboveThresholdMs = 0;
-    _rmsSmooth = 0.0;
-    _pcmBuf.clear();
-    _pendingStartBuf.clear();
+    _utteranceStartMs = 0;
+    _currentUtterance.clear();
     _preRollFrames.clear();
-    _preRollBytes = 0;
+    _utteranceQueue.clear();
+    _processingQueue = false;
+    _utteranceCounter = 0;
+    _processedUtterances = 0;
+    _rmsSmooth = 0.0;
     _micChunkCount = 0;
-    _chunksSent = 0;
-    _bytesSent = 0;
     _partialCount = 0;
     _finalCount = 0;
+    _chunksSent = 0;
+    _bytesSent = 0;
 
     setState(() {
       running = true;
@@ -458,21 +424,28 @@ class _SttHomePageState extends State<SttHomePage> {
     final total = PerfTimer('main.stopTotal');
 
     running = false;
-    _utteranceOpen = false;
 
     await _micSub?.cancel();
     _micSub = null;
 
-    if (_sttSessionActive || _sessionStarting) {
-      await _endSttSession();
+    if (_utteranceOpen) {
+      _utteranceOpen = false;
+      _log('Stop pressed: closing current utterance');
+      _enqueueCurrentUtterance();
     }
 
     await mic.stop();
 
-    _pcmBuf.clear();
-    _pendingStartBuf.clear();
+    if (mounted) {
+      setState(() {
+        partial = '(finishing queued utterances...)';
+      });
+    }
+
+    await _waitForQueueToFinish();
+
+    _currentUtterance.clear();
     _preRollFrames.clear();
-    _preRollBytes = 0;
     _rmsSmooth = 0.0;
 
     if (!mounted) return;
@@ -490,9 +463,10 @@ class _SttHomePageState extends State<SttHomePage> {
 
   String get _statusText {
     if (!running) return 'Idle';
-    if (_sessionStopping) return 'Finishing utterance';
-    if (_sessionStarting) return 'Starting utterance';
-    if (_utteranceOpen) return 'Speech detected';
+    if (_utteranceOpen && _processingQueue) return 'Recording + decoding queue';
+    if (_utteranceOpen) return 'Recording utterance';
+    if (_processingQueue) return 'Decoding queued utterance';
+    if (_utteranceQueue.isNotEmpty) return 'Queued utterances: ${_utteranceQueue.length}';
     return 'Listening';
   }
 
@@ -509,7 +483,7 @@ class _SttHomePageState extends State<SttHomePage> {
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Text(
-                  partial.isEmpty ? "(partial transcript appears here)" : partial,
+                  partial.isEmpty ? '(partial transcript appears here)' : partial,
                   style: const TextStyle(fontSize: 22),
                 ),
               ),
@@ -517,7 +491,7 @@ class _SttHomePageState extends State<SttHomePage> {
             const SizedBox(height: 8),
             Text('Status: $_statusText'),
             const SizedBox(height: 4),
-            Text("Mic level (RMS): ${rms.toStringAsFixed(3)}"),
+            Text('Mic level (RMS): ${rms.toStringAsFixed(3)}'),
             const SizedBox(height: 12),
             Row(
               children: [
